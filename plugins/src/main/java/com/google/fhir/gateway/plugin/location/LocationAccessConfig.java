@@ -40,11 +40,23 @@ public final class LocationAccessConfig {
 
   private LocationAccessConfig() {}
 
+  /** Env var override for {@link #locationTagSystem} (NGSA: supervision-location CodeSystem). */
+  private static final String LOCATION_TAG_SYSTEM_ENV = "LOCATION_TAG_SYSTEM";
+
   public static LocationAccessConfig loadDefault() {
     try {
-      return loadFromClasspath(DEFAULT_CONFIG_PATH);
+      LocationAccessConfig cfg = loadFromClasspath(DEFAULT_CONFIG_PATH);
+      cfg.applyEnvOverrides();
+      return cfg;
     } catch (IOException e) {
       throw new IllegalStateException("Failed to load location access config", e);
+    }
+  }
+
+  private void applyEnvOverrides() {
+    String tagSystem = System.getenv(LOCATION_TAG_SYSTEM_ENV);
+    if (tagSystem != null && !tagSystem.isBlank()) {
+      locationTagSystem = tagSystem.trim();
     }
   }
 

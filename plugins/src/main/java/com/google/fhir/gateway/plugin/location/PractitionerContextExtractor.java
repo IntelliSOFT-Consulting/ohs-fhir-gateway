@@ -16,51 +16,141 @@
 package com.google.fhir.gateway.plugin.location;
 
 import com.google.common.base.Preconditions;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
-import org.hl7.fhir.r4.model.Extension;
-import org.hl7.fhir.r4.model.Practitioner;
+import java.util.Set;
+import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.CodeableConcept;
+import org.hl7.fhir.r4.model.Coding;
+import org.hl7.fhir.r4.model.PractitionerRole;
 import org.hl7.fhir.r4.model.Reference;
-import org.hl7.fhir.r4.model.StringType;
 
-/** Extracts role and assigned location from a Practitioner resource. */
+/** Extracts role and assigned location from a PractitionerRole resource. */
 final class PractitionerContextExtractor {
 
   private PractitionerContextExtractor() {}
 
-  static String extractRole(Practitioner practitioner, LocationAccessConfig config) {
-    Preconditions.checkNotNull(practitioner, "practitioner");
-    Preconditions.checkNotNull(config, "config");
-    List<Extension> exts = practitioner.getExtensionsByUrl(config.getRoleExtensionUrl());
-    if (exts.isEmpty()) {
-      throw new IllegalArgumentException(
-          "No role extension found at url: " + config.getRoleExtensionUrl());
+  /**
+   * Extracts the role code from the first PractitionerRole in the bundle. Uses the first coding in
+   * the first code element.
+   */
+  static String extractRoleFromPractitionerRole(Bundle bundle) {
+    Preconditions.checkNotNull(bundle, "bundle");
+    if (bundle.getEntry().isEmpty()) {
+      throw new IllegalArgumentException("No PractitionerRole found for practitioner");
     }
-    Extension e = exts.get(0);
-    if (e.getValue() instanceof StringType) {
-      return ((StringType) e.getValue()).getValue();
+    PractitionerRole role = (PractitionerRole) bundle.getEntry().get(0).getResource();
+    List<CodeableConcept> codes = role.getCode();
+    if (codes.isEmpty()) {
+      throw new IllegalArgumentException("PractitionerRole has no code");
     }
-    throw new IllegalArgumentException("Role extension value is not a StringType");
+    List<Coding> codings = codes.get(0).getCoding();
+    if (codings.isEmpty()) {
+      throw new IllegalArgumentException("PractitionerRole code has no coding");
+    }
+    String code = codings.get(0).getCode();
+    if (code == null || code.isEmpty()) {
+      throw new IllegalArgumentException("PractitionerRole coding has empty code");
+    }
+    return code;
   }
 
-  static String extractPrimaryLocationId(Practitioner practitioner, LocationAccessConfig config) {
-    Preconditions.checkNotNull(practitioner, "practitioner");
-    Preconditions.checkNotNull(config, "config");
-    List<Extension> exts = practitioner.getExtensionsByUrl(config.getLocationExtensionUrl());
-    if (exts.isEmpty()) {
-      throw new IllegalArgumentException(
-          "No location extension found at url: " + config.getLocationExtensionUrl());
+  /**
+   * Extracts the primary location ID from the first PractitionerRole in the bundle. Returns the
+   * bare ID (strips "Location/" prefix if present).
+   */
+  static String extractPrimaryLocationIdFromPractitionerRole(Bundle bundle) {
+    Preconditions.checkNotNull(bundle, "bundle");
+    if (bundle.getEntry().isEmpty()) {
+      throw new IllegalArgumentException("No PractitionerRole found for practitioner");
     }
-    Extension e = exts.get(0);
-    if (e.getValue() instanceof Reference) {
-      String ref = ((Reference) e.getValue()).getReference();
-      if (ref == null) {
-        throw new IllegalArgumentException("Location reference is null");
-      }
-      if (ref.startsWith("Location/")) {
-        return ref.substring("Location/".length());
-      }
-      return ref;
+    PractitionerRole role = (PractitionerRole) bundle.getEntry().get(0).getResource();
+    List<Reference> locations = role.getLocation();
+    if (locations.isEmpty()) {
+      throw new IllegalArgumentException("PractitionerRole has no location");
     }
-    throw new IllegalArgumentException("Location extension value is not a Reference");
+    String ref = locations.get(0).getReference();
+    if (ref == null) {
+      throw new IllegalArgumentException("PractitionerRole location reference is null");
+    }
+    if (ref.startsWith("Location/")) {
+      return ref.substring("Location/".length());
+    }
+    return ref;
+  }
+
+  /**
+   * Extracts role and all assigned location IDs from every PractitionerRole in the bundle. Role is
+   * taken from the first entry; locations are unioned across all entries.
+   */
+  static PractitionerRoleContext extractAllFromPractitionerRoleBundle(Bundle bundle) {
+    Preconditions.checkNotNull(bundle, "bundle");
+    if (bundle.getEntry().isEmpty()) {
+      throw new IllegalArgumentException("No PractitionerRole found for practitioner");
+    }
+
+    String role = null;
+    Set<String> locationIds = new LinkedHashSet<>();
+    for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
+      if (!(entry.getResource() instanceof PractitionerRole)) {
+        continue;
+      }
+      PractitionerRole pr = (PractitionerRole) entry.getResource();
+      if (role == null) {
+        List<CodeableConcept> codes = pr.getCode();
+        if (codes.isEmpty()) {
+          throw new IllegalArgumentException("PractitionerRole has no code");
+        }
+        List<Coding> codings = codes.get(0).getCoding();
+        if (codings.isEmpty()) {
+          throw new IllegalArgumentException("PractitionerRole code has no coding");
+        }
+        String code = codings.get(0).getCode();
+        if (code == null || code.isEmpty()) {
+          throw new IllegalArgumentException("PractitionerRole coding has empty code");
+        }
+        role = code;
+      }
+      for (Reference locationRef : pr.getLocation()) {
+        String ref = locationRef.getReference();
+        if (ref == null) {
+          continue;
+        }
+        if (ref.startsWith("Location/")) {
+          locationIds.add(ref.substring("Location/".length()));
+        } else {
+          locationIds.add(ref);
+        }
+      }
+    }
+
+    if (role == null) {
+      throw new IllegalArgumentException("No PractitionerRole found for practitioner");
+    }
+    if (locationIds.isEmpty()) {
+      throw new IllegalArgumentException("PractitionerRole has no location");
+    }
+
+    return new PractitionerRoleContext(role, new ArrayList<>(locationIds));
+  }
+
+  /** Role plus all assigned location IDs for a practitioner. */
+  static final class PractitionerRoleContext {
+    private final String role;
+    private final List<String> assignedLocationIds;
+
+    PractitionerRoleContext(String role, List<String> assignedLocationIds) {
+      this.role = role;
+      this.assignedLocationIds = assignedLocationIds;
+    }
+
+    String role() {
+      return role;
+    }
+
+    List<String> assignedLocationIds() {
+      return assignedLocationIds;
+    }
   }
 }

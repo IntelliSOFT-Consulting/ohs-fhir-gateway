@@ -1,0 +1,17 @@
+{
+  "resourceType": "Patient",
+  "id": "patient-1",
+  "meta": {
+    "tag": [
+      {
+        "system": "https://www.example.com/CodeSystem/supervision-location",
+        "code": "cu-under-1908"
+      },
+      {
+        "system": "https://www.example.com/CodeSystem/processing-status",
+        "code": "completed"
+      }
+    ]
+  },
+  "name": [{ "family": "Test", "given": ["Patient"] }]
+}

@@ -1,18 +1,24 @@
 {
     "roleHierarchy": {
-        "ADMINISTRATOR": "COUNTRY",
-        "COUNTRY_ADMINISTRATOR": "COUNTRY",
-        "PROGRAM_MANAGER": "COUNTRY",
-        "COUNTY_ADMINISTRATOR": "COUNTY",
-        "PEER_COACH": "COUNTY",
-        "SUBCOUNTY_DISEASE_SURVEILLANCE_OFFICER": "SUB-COUNTY",
-        "CHA": "COMMUNITY-UNIT"
+        "admin": "country",
+        "country-administrator": "country",
+        "program-manager": "country",
+        "peer-coach": "county",
+        "community-health-assistant": "community-unit",
+        "ADMINISTRATOR": "country",
+        "COUNTRY_ADMINISTRATOR": "country",
+        "PROGRAM_MANAGER": "country",
+        "APPLICATION": "country",
+        "COUNTY_ADMINISTRATOR": "county",
+        "PEER_COACH": "county",
+        "SUBCOUNTY_DISEASE_SURVEILLANCE_OFFICER": "sub-county",
+        "CHA": "community-unit"
     },
-    "locationTagSystem": "http://example.org/fhir/StructureDefinition/encounter-managingLocation",
+    "locationTagSystem": "https://www.example.com/CodeSystem/supervision-location",
     "practitionerClaimName": "sub",
     "locationExtensionUrl": "http://example.org/location",
     "roleExtensionUrl": "http://example.org/fhir/StructureDefinition/role-group",
-    "rootLocationTypeCode": "COUNTRY",
-    "leafLocationTypeCode": "COMMUNITY-UNIT",
+    "rootLocationTypeCode": "country",
+    "leafLocationTypeCode": "community-unit",
     "maxDescendantTagsInSearch": 200
 }

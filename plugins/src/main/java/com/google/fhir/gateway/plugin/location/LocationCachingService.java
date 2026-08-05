@@ -46,7 +46,6 @@ import javax.sql.DataSource;
 import org.apache.http.HttpResponse;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Location;
-import org.hl7.fhir.r4.model.Practitioner;
 import org.hl7.fhir.r4.model.Reference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -116,6 +115,7 @@ public class LocationCachingService {
             String baseUrl = System.getenv("PROXY_TO");
             fullSyncLocations(client, ctx, baseUrl);
             logger.info("Completed Location full sync.");
+            validateCountryHierarchy(client, ctx);
           } catch (Exception e) {
             logger.error("Location full sync failed; continuing with fetch-through only.", e);
             syncStarted.set(false);
@@ -188,18 +188,101 @@ public class LocationCachingService {
       return cached;
     }
 
-    // Fetch-through from FHIR
-    HttpResponse resp = httpFhirClient.getResource("Practitioner/" + practitionerId);
-    HttpUtil.validateResponseEntityOrFail(resp, "Practitioner/" + practitionerId);
-    Practitioner practitioner =
-        (Practitioner) ctx.newJsonParser().parseResource(resp.getEntity().getContent());
+    // Fetch all PractitionerRoles — NGSA creates one per assigned community unit.
+    Bundle roleBundle = fetchAllPractitionerRoles(httpFhirClient, ctx, practitionerId);
+    PractitionerContextExtractor.PractitionerRoleContext roleContext =
+        PractitionerContextExtractor.extractAllFromPractitionerRoleBundle(roleBundle);
 
-    String role = PractitionerContextExtractor.extractRole(practitioner, config);
-    String locationId = PractitionerContextExtractor.extractPrimaryLocationId(practitioner, config);
-
-    PractitionerContext fresh = new PractitionerContext(role, locationId);
+    PractitionerContext fresh =
+        new PractitionerContext(roleContext.role(), roleContext.assignedLocationIds());
     writePractitionerContext(practitionerId, fresh);
     return fresh;
+  }
+
+  private static Bundle fetchAllPractitionerRoles(
+      HttpFhirClient httpFhirClient, FhirContext ctx, String practitionerId) throws IOException {
+    String baseQuery =
+        "PractitionerRole?practitioner=Practitioner/" + practitionerId + "&_count=100";
+    Bundle combined = new Bundle();
+    combined.setType(Bundle.BundleType.SEARCHSET);
+    String nextPath = baseQuery;
+    int pages = 0;
+    while (nextPath != null && pages < 100) {
+      pages++;
+      HttpResponse roleResp = httpFhirClient.getResource(nextPath);
+      HttpUtil.validateResponseEntityOrFail(roleResp, nextPath);
+      Bundle page = (Bundle) ctx.newJsonParser().parseResource(roleResp.getEntity().getContent());
+      combined.getEntry().addAll(page.getEntry());
+      nextPath = nextPageResourcePath(page, System.getenv("PROXY_TO"));
+    }
+    return combined;
+  }
+
+  private void validateCountryHierarchy(HttpFhirClient client, FhirContext ctx) {
+    String rootId = System.getenv("ROOT_LOCATION_ID");
+    if (rootId == null || rootId.isBlank()) {
+      logger.warn(
+          "ROOT_LOCATION_ID is not set; country-level gateway searches may fail closed if the"
+              + " hierarchy is incomplete.");
+      return;
+    }
+
+    try {
+      HttpResponse resp = client.getResource("Location/" + rootId);
+      if (resp.getStatusLine().getStatusCode() == 404) {
+        logger.error(
+            "ROOT_LOCATION_ID={} does not exist on the FHIR server; country-level searches will"
+                + " fail closed.",
+            rootId);
+        return;
+      }
+      HttpUtil.validateResponseEntityOrFail(resp, "Location/" + rootId);
+      Location root = (Location) ctx.newJsonParser().parseResource(resp.getEntity().getContent());
+      Set<String> typeCodes = extractLocationTypeCodes(root);
+      if (!typeCodes.contains("country")) {
+        logger.warn(
+            "ROOT_LOCATION_ID={} has types {} but expected type 'country'.", rootId, typeCodes);
+      }
+
+      List<String> unlinkedCounties = findCountiesNotLinkedToRoot(rootId);
+      if (!unlinkedCounties.isEmpty()) {
+        logger.warn(
+            "Found {} county Location(s) not linked to ROOT_LOCATION_ID={} via partOf: {}."
+                + " Country/program-manager gateway searches may return no results.",
+            unlinkedCounties.size(),
+            rootId,
+            unlinkedCounties.size() <= 10
+                ? unlinkedCounties
+                : unlinkedCounties.subList(0, 10) + "...");
+      }
+    } catch (Exception e) {
+      logger.warn("Country hierarchy validation failed (non-fatal)", e);
+    }
+  }
+
+  private List<String> findCountiesNotLinkedToRoot(String rootId) {
+    Instant cutoff = clock.instant().minus(ttl);
+    List<String> out = new java.util.ArrayList<>();
+    try (Connection c = dataSource.getConnection();
+        PreparedStatement ps =
+            c.prepareStatement(
+                "SELECT id, part_of_id FROM "
+                    + SCHEMA
+                    + ".location WHERE 'county' = ANY(type_codes) AND fetched_at >= ?")) {
+      setInstant(ps, 1, cutoff);
+      try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) {
+          String id = rs.getString(1);
+          String partOf = rs.getString(2);
+          if (!rootId.equals(partOf)) {
+            out.add(id);
+          }
+        }
+      }
+    } catch (SQLException e) {
+      logger.warn("Failed to query counties for hierarchy validation", e);
+    }
+    return out;
   }
 
   /**
@@ -344,7 +427,7 @@ public class LocationCachingService {
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps =
             c.prepareStatement(
-                "SELECT role, primary_location_id, fetched_at FROM "
+                "SELECT role, primary_location_id, assigned_location_ids, fetched_at FROM "
                     + SCHEMA
                     + ".practitioner_context WHERE id=?")) {
       ps.setString(1, practitionerId);
@@ -352,12 +435,29 @@ public class LocationCachingService {
         if (!rs.next()) {
           return null;
         }
-        Timestamp ts = rs.getTimestamp(3);
+        Timestamp ts = rs.getTimestamp(4);
         Instant fetchedAt = ts != null ? ts.toInstant() : null;
         if (fetchedAt == null || fetchedAt.isBefore(cutoff)) {
           return null;
         }
-        return new PractitionerContext(rs.getString(1), rs.getString(2));
+        String role = rs.getString(1);
+        String primaryLocationId = rs.getString(2);
+        List<String> assignedLocationIds = new java.util.ArrayList<>();
+        java.sql.Array assignedArray = rs.getArray(3);
+        if (assignedArray != null) {
+          String[] assigned = (String[]) assignedArray.getArray();
+          if (assigned != null) {
+            for (String id : assigned) {
+              if (id != null && !id.isBlank()) {
+                assignedLocationIds.add(id);
+              }
+            }
+          }
+        }
+        if (assignedLocationIds.isEmpty() && primaryLocationId != null) {
+          assignedLocationIds = List.of(primaryLocationId);
+        }
+        return new PractitionerContext(role, assignedLocationIds);
       }
     } catch (SQLException e) {
       throw new IllegalStateException("Failed to read practitioner context cache", e);
@@ -366,19 +466,23 @@ public class LocationCachingService {
 
   private void writePractitionerContext(String practitionerId, PractitionerContext ctx) {
     Instant now = clock.instant();
+    String primaryLocationId = ctx.primaryLocationId();
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps =
             c.prepareStatement(
                 "INSERT INTO "
                     + SCHEMA
-                    + ".practitioner_context (id, role, primary_location_id, fetched_at) VALUES (?,"
-                    + " ?, ?, ?) ON CONFLICT (id) DO UPDATE SET role=EXCLUDED.role,"
+                    + ".practitioner_context (id, role, primary_location_id,"
+                    + " assigned_location_ids, fetched_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id)"
+                    + " DO UPDATE SET role=EXCLUDED.role,"
                     + " primary_location_id=EXCLUDED.primary_location_id,"
+                    + " assigned_location_ids=EXCLUDED.assigned_location_ids,"
                     + " fetched_at=EXCLUDED.fetched_at")) {
       ps.setString(1, practitionerId);
       ps.setString(2, ctx.role());
-      ps.setString(3, ctx.primaryLocationId());
-      setInstant(ps, 4, now);
+      ps.setString(3, primaryLocationId);
+      ps.setArray(4, c.createArrayOf("text", ctx.assignedLocationIds().toArray(new String[0])));
+      setInstant(ps, 5, now);
       ps.executeUpdate();
     } catch (SQLException e) {
       throw new IllegalStateException("Failed to write practitioner context cache", e);
@@ -521,8 +625,14 @@ public class LocationCachingService {
               + "id TEXT PRIMARY KEY,"
               + "role TEXT NOT NULL,"
               + "primary_location_id TEXT NOT NULL,"
+              + "assigned_location_ids TEXT[] NOT NULL DEFAULT '{}',"
               + "fetched_at TIMESTAMPTZ NOT NULL"
               + ")");
+      st.execute(
+          "ALTER TABLE "
+              + SCHEMA
+              + ".practitioner_context ADD COLUMN IF NOT EXISTS assigned_location_ids TEXT[] NOT"
+              + " NULL DEFAULT '{}'");
       st.execute(
           "CREATE INDEX IF NOT EXISTS idx_practitioner_context_fetched_at ON "
               + SCHEMA
@@ -666,19 +776,29 @@ public class LocationCachingService {
   /** Value object for practitioner context. */
   public static final class PractitionerContext {
     private final String role;
-    private final String primaryLocationId;
+    private final List<String> assignedLocationIds;
 
-    public PractitionerContext(String role, String primaryLocationId) {
+    public PractitionerContext(String role, List<String> assignedLocationIds) {
+      Preconditions.checkNotNull(role, "role");
+      Preconditions.checkNotNull(assignedLocationIds, "assignedLocationIds");
+      if (assignedLocationIds.isEmpty()) {
+        throw new IllegalArgumentException("assignedLocationIds must not be empty");
+      }
       this.role = role;
-      this.primaryLocationId = primaryLocationId;
+      this.assignedLocationIds = List.copyOf(assignedLocationIds);
     }
 
     public String role() {
       return role;
     }
 
+    /** First assigned location (backward compatible primary). */
     public String primaryLocationId() {
-      return primaryLocationId;
+      return assignedLocationIds.get(0);
+    }
+
+    public List<String> assignedLocationIds() {
+      return assignedLocationIds;
     }
   }
 }
