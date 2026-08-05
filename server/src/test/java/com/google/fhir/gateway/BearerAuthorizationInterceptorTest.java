@@ -354,6 +354,27 @@ public class BearerAuthorizationInterceptorTest {
   }
 
   @Test
+  public void authorizeRequestMetadataNoAuthWithAuditLogging() throws IOException {
+    noAuthRequestSetup(BearerAuthorizationInterceptor.METADATA_PATH);
+    URL capabilityUrl = Resources.getResource("capability.json");
+    String capabilityJson = Resources.toString(capabilityUrl, StandardCharsets.UTF_8);
+    setupFhirResponse(capabilityJson, false);
+
+    BearerAuthorizationInterceptor testInstance = createTestInstance(true, null, true);
+    testInstance.authorizeRequest(requestMock);
+
+    IParser parser = fhirContext.newJsonParser();
+    IBaseResource resource = parser.parseResource(writerStub.toString());
+    assertThat(resource, instanceOf(CapabilityStatement.class));
+    CapabilityStatement capability = (CapabilityStatement) resource;
+    assertThat(capability.getRest().get(0).getSecurity().getCors(), equalTo(true));
+    assertThat(
+        capability.getRest().get(0).getSecurity().getService().get(0).getCoding().get(0).getCode(),
+        equalTo("OAuth"));
+    Mockito.verify(fhirClientMock, Mockito.never()).postResource(any(AuditEvent.class));
+  }
+
+  @Test
   public void authorizeAllowedUnauthenticatedRequest() throws IOException {
     // Changing the access-checker to something that always denies except the allowed queries
     testInstance =

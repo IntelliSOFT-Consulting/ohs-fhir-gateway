@@ -52,8 +52,13 @@ public class JwtUtil {
   }
 
   public static DecodedJWT getDecodedJwtFromRequestDetails(RequestDetailsReader requestDetails) {
-    if (requestDetails == null) return null;
+    if (requestDetails == null) {
+      throw new JWTDecodeException("Request details are null");
+    }
     String authHeader = requestDetails.getHeader(HttpHeaders.AUTHORIZATION);
+    if (authHeader == null || !authHeader.startsWith(TokenVerifier.BEARER_PREFIX)) {
+      throw new JWTDecodeException("No Authorization Bearer token provided");
+    }
     String bearerToken = authHeader.substring(TokenVerifier.BEARER_PREFIX.length());
     return JWT.decode(bearerToken);
   }

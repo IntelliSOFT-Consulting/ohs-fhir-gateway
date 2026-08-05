@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2025 Google LLC
+ * Copyright 2021-2026 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,12 +22,14 @@ import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTDecodeException;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.auth0.jwt.interfaces.DecodedJWT;
-import com.auth0.jwt.interfaces.Verification;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.io.IOException;
+import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +38,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.EncodedKeySpec;
 import java.security.spec.InvalidKeySpecException;
+import java.security.spec.RSAPublicKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.HashMap;
@@ -50,7 +53,9 @@ public class TokenVerifier {
   private static final Logger logger = LoggerFactory.getLogger(TokenVerifier.class);
   private static final String TOKEN_ISSUER_ENV = "TOKEN_ISSUER";
   private static final String WELL_KNOWN_ENDPOINT_ENV = "WELL_KNOWN_ENDPOINT";
+  private static final String KEYCLOAK_INTERNAL_BASE_URL_ENV = "KEYCLOAK_INTERNAL_BASE_URL";
   private static final String WELL_KNOWN_ENDPOINT_DEFAULT = ".well-known/openid-configuration";
+  private static final String JWKS_CERTS_PATH = "/protocol/openid-connect/certs";
   public static final String BEARER_PREFIX = "Bearer ";
 
   // TODO: Make this configurable or based on the given JWT; we should at least support some other
@@ -58,12 +63,9 @@ public class TokenVerifier {
   private static final String SIGN_ALGORITHM = "RS256";
 
   private final String tokenIssuer;
-  // Note the Verification class is _not_ thread-safe but the JWTVerifier instances created by its
-  // `build()` are thread-safe and reusable. It is important to reuse those instances, otherwise
-  // we may end up with a memory leak; details: https://github.com/auth0/java-jwt/issues/592
-  // Access to `jwtVerifierConfig` and `verifierForIssuer` should be non-concurrent.
-  private final Verification jwtVerifierConfig;
-  private final Map<String, JWTVerifier> verifierForIssuer;
+  // Access to `verifierForIssuerKid` and `publicKeyForIssuerKid` should be non-concurrent.
+  private final Map<String, JWTVerifier> verifierForIssuerKid;
+  private final Map<String, RSAPublicKey> publicKeyForIssuerKid;
   private final HttpUtil httpUtil;
   private final String configJson;
 
@@ -72,10 +74,9 @@ public class TokenVerifier {
       throws IOException {
     this.tokenIssuer = tokenIssuer;
     this.httpUtil = httpUtil;
-    RSAPublicKey issuerPublicKey = fetchAndDecodePublicKey();
-    jwtVerifierConfig = JWT.require(Algorithm.RSA256(issuerPublicKey, null));
     this.configJson = httpUtil.fetchWellKnownConfig(tokenIssuer, wellKnownEndpoint);
-    this.verifierForIssuer = new HashMap<>();
+    this.verifierForIssuerKid = new HashMap<>();
+    this.publicKeyForIssuerKid = new HashMap<>();
   }
 
   public static TokenVerifier createFromEnvVars() throws IOException {
@@ -100,15 +101,13 @@ public class TokenVerifier {
     return configJson;
   }
 
-  private RSAPublicKey fetchAndDecodePublicKey() throws IOException {
+  private RSAPublicKey fetchAndDecodePublicKey(String realmMetadataUrl) throws IOException {
     // Preconditions.checkState(SIGN_ALGORITHM.equals("ES512"));
     Preconditions.checkState(SIGN_ALGORITHM.equals("RS256"));
     // final String keyAlgorithm = "EC";
     final String keyAlgorithm = "RSA";
     try {
-      // TODO: Make sure this works for any issuer not just Keycloak; instead of this we should
-      // read the metadata and choose the right endpoint for the keys.
-      HttpResponse response = httpUtil.getResourceOrFail(new URI(tokenIssuer));
+      HttpResponse response = httpUtil.getResourceOrFail(new URI(realmMetadataUrl));
       JsonObject jsonObject =
           JsonParser.parseString(EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8))
               .getAsJsonObject();
@@ -122,7 +121,10 @@ public class TokenVerifier {
       return (RSAPublicKey) keyFactory.generatePublic(keySpec);
     } catch (URISyntaxException e) {
       ExceptionUtil.throwRuntimeExceptionAndLog(
-          logger, "Error in token issuer URI " + tokenIssuer, e, AuthenticationException.class);
+          logger,
+          "Error in token issuer URI " + realmMetadataUrl,
+          e,
+          AuthenticationException.class);
     } catch (NoSuchAlgorithmException e) {
       ExceptionUtil.throwRuntimeExceptionAndLog(
           logger, "Invalid algorithm " + keyAlgorithm, e, AuthenticationException.class);
@@ -134,11 +136,141 @@ public class TokenVerifier {
     return null;
   }
 
-  private synchronized JWTVerifier getJwtVerifier(String issuer) {
+  private RSAPublicKey fetchPublicKeyFromJwks(String jwksUrl, String kid) throws IOException {
+    try {
+      HttpResponse response = httpUtil.getResourceOrFail(new URI(jwksUrl));
+      JsonObject jwks =
+          JsonParser.parseString(EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8))
+              .getAsJsonObject();
+      JsonArray keys = jwks.getAsJsonArray("keys");
+      if (keys == null) {
+        return null;
+      }
+      for (JsonElement keyElement : keys) {
+        JsonObject key = keyElement.getAsJsonObject();
+        if (!key.has("kid") || !kid.equals(key.get("kid").getAsString())) {
+          continue;
+        }
+        if (!"RSA".equals(key.get("kty").getAsString())) {
+          continue;
+        }
+        if (key.has("use") && !"sig".equals(key.get("use").getAsString())) {
+          continue;
+        }
+        if (!key.has("n") || !key.has("e")) {
+          continue;
+        }
+        return decodeRsaPublicKeyFromJwk(key.get("n").getAsString(), key.get("e").getAsString());
+      }
+      logger.warn("No matching signing key found in JWKS {} for kid {}", jwksUrl, kid);
+      return null;
+    } catch (URISyntaxException e) {
+      ExceptionUtil.throwRuntimeExceptionAndLog(
+          logger, "Error in JWKS URI " + jwksUrl, e, AuthenticationException.class);
+    } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+      ExceptionUtil.throwRuntimeExceptionAndLog(
+          logger,
+          String.format("Invalid JWKS key for kid %s: %s", kid, e.getMessage()),
+          e,
+          AuthenticationException.class);
+    }
+    return null;
+  }
+
+  private static RSAPublicKey decodeRsaPublicKeyFromJwk(
+      String modulusBase64Url, String exponentBase64Url)
+      throws NoSuchAlgorithmException, InvalidKeySpecException {
+    BigInteger modulus = new BigInteger(1, base64UrlDecode(modulusBase64Url));
+    BigInteger exponent = new BigInteger(1, base64UrlDecode(exponentBase64Url));
+    RSAPublicKeySpec keySpec = new RSAPublicKeySpec(modulus, exponent);
+    return (RSAPublicKey) KeyFactory.getInstance("RSA").generatePublic(keySpec);
+  }
+
+  private static byte[] base64UrlDecode(String value) {
+    return Base64.getUrlDecoder().decode(value);
+  }
+
+  /**
+   * Resolves the Keycloak realm metadata URL used to fetch the RSA public key.
+   *
+   * <p>In DEV mode, when the JWT {@code iss} claim uses the public hostname (e.g. {@code
+   * https://ngsadev.example.com/realms/ngsa}) but {@code TOKEN_ISSUER} points at an internal
+   * Keycloak base URL, fetch the key from {@code KEYCLOAK_INTERNAL_BASE_URL}/realms/{realm} so
+   * signature verification uses the correct realm keys.
+   */
+  private String resolveRealmMetadataUrl(String jwtIssuer) {
+    if (jwtIssuer.equals(tokenIssuer)) {
+      return tokenIssuer;
+    }
+    if (FhirProxyServer.isDevMode()) {
+      String realm = extractRealmName(jwtIssuer);
+      String internalBase = System.getenv(KEYCLOAK_INTERNAL_BASE_URL_ENV);
+      if (realm != null && internalBase != null && !internalBase.isBlank()) {
+        String base =
+            internalBase.endsWith("/")
+                ? internalBase.substring(0, internalBase.length() - 1)
+                : internalBase;
+        return base + "/realms/" + realm;
+      }
+      logger.warn(
+          "JWT issuer {} differs from TOKEN_ISSUER {}; using JWT issuer URL for public key fetch.",
+          jwtIssuer,
+          tokenIssuer);
+    }
+    return jwtIssuer;
+  }
+
+  private String resolveJwksUrl(String jwtIssuer) {
+    return resolveRealmMetadataUrl(jwtIssuer) + JWKS_CERTS_PATH;
+  }
+
+  static String extractRealmName(String issuerUrl) {
+    if (issuerUrl == null || issuerUrl.isBlank()) {
+      return null;
+    }
+    String marker = "/realms/";
+    int idx = issuerUrl.indexOf(marker);
+    if (idx < 0) {
+      return null;
+    }
+    String rest = issuerUrl.substring(idx + marker.length());
+    int end = rest.indexOf('/');
+    return end < 0 ? rest : rest.substring(0, end);
+  }
+
+  private static String cacheKey(String issuer, String kid) {
+    return issuer + "#" + (kid == null ? "" : kid);
+  }
+
+  private synchronized void invalidateCachesForIssuer(String issuer) {
+    verifierForIssuerKid.keySet().removeIf(key -> key.startsWith(issuer + "#"));
+    publicKeyForIssuerKid.keySet().removeIf(key -> key.startsWith(issuer + "#"));
+    logger.info("Invalidated cached JWT verification keys for issuer {}", issuer);
+  }
+
+  private synchronized RSAPublicKey getPublicKeyForIssuer(String jwtIssuer, String kid)
+      throws IOException {
+    String cacheEntryKey = cacheKey(jwtIssuer, kid);
+    if (!publicKeyForIssuerKid.containsKey(cacheEntryKey)) {
+      RSAPublicKey publicKey = null;
+      if (kid != null && !kid.isBlank()) {
+        publicKey = fetchPublicKeyFromJwks(resolveJwksUrl(jwtIssuer), kid);
+      }
+      if (publicKey == null) {
+        publicKey = fetchAndDecodePublicKey(resolveRealmMetadataUrl(jwtIssuer));
+      }
+      publicKeyForIssuerKid.put(cacheEntryKey, publicKey);
+    }
+    return publicKeyForIssuerKid.get(cacheEntryKey);
+  }
+
+  private synchronized JWTVerifier getJwtVerifier(String issuer, String kid) throws IOException {
     if (!tokenIssuer.equals(issuer)) {
       if (FhirProxyServer.isDevMode()) {
-        // If server is in DEV mode, set issuer to one from request
-        logger.warn("Server run in DEV mode. Setting issuer to issuer from request.");
+        logger.warn(
+            "Server run in DEV mode. JWT issuer {} differs from configured TOKEN_ISSUER {}.",
+            issuer,
+            tokenIssuer);
       } else {
         ExceptionUtil.throwRuntimeExceptionAndLog(
             logger,
@@ -147,10 +279,13 @@ public class TokenVerifier {
         return null;
       }
     }
-    if (!verifierForIssuer.containsKey(issuer)) {
-      verifierForIssuer.put(issuer, jwtVerifierConfig.withIssuer(issuer).build());
+    String cacheEntryKey = cacheKey(issuer, kid);
+    if (!verifierForIssuerKid.containsKey(cacheEntryKey)) {
+      RSAPublicKey publicKey = getPublicKeyForIssuer(issuer, kid);
+      verifierForIssuerKid.put(
+          cacheEntryKey, JWT.require(Algorithm.RSA256(publicKey, null)).withIssuer(issuer).build());
     }
-    return verifierForIssuer.get(issuer);
+    return verifierForIssuerKid.get(cacheEntryKey);
   }
 
   @VisibleForTesting
@@ -170,12 +305,12 @@ public class TokenVerifier {
           logger, "Failed to decode JWT: " + e.getMessage(), e, AuthenticationException.class);
     }
     String issuer = jwt.getIssuer();
+    String kid = jwt.getKeyId();
     String algorithm = jwt.getAlgorithm();
-    JWTVerifier jwtVerifier = getJwtVerifier(issuer);
     logger.info(
         String.format(
-            "JWT issuer is %s, audience is %s, and algorithm is %s",
-            issuer, jwt.getAudience(), algorithm));
+            "JWT issuer is %s, audience is %s, algorithm is %s, kid is %s",
+            issuer, jwt.getAudience(), algorithm, kid));
 
     if (!SIGN_ALGORITHM.equals(algorithm)) {
       ExceptionUtil.throwRuntimeExceptionAndLog(
@@ -184,18 +319,40 @@ public class TokenVerifier {
               "Only %s signing algorithm is supported, got %s", SIGN_ALGORITHM, algorithm),
           AuthenticationException.class);
     }
-    DecodedJWT verifiedJwt = null;
+
     try {
-      verifiedJwt = jwtVerifier.verify(jwt);
+      return verifyJwtWithRetry(jwt, issuer, kid, false);
+    } catch (IOException e) {
+      ExceptionUtil.throwRuntimeExceptionAndLog(
+          logger,
+          String.format("Failed to fetch public key for issuer %s: %s", issuer, e.getMessage()),
+          e,
+          AuthenticationException.class);
+      return null;
+    }
+  }
+
+  private DecodedJWT verifyJwtWithRetry(
+      DecodedJWT jwt, String issuer, String kid, boolean alreadyRetried) throws IOException {
+    JWTVerifier jwtVerifier = getJwtVerifier(issuer, kid);
+    try {
+      return jwtVerifier.verify(jwt);
     } catch (JWTVerificationException e) {
-      // Throwing an AuthenticationException instead since it is handled by HAPI and a 401
-      // status code is returned in the response.
+      if (!alreadyRetried) {
+        logger.warn(
+            "JWT signature verification failed for issuer {} kid {}; refreshing keys and retrying"
+                + " once.",
+            issuer,
+            kid);
+        invalidateCachesForIssuer(issuer);
+        return verifyJwtWithRetry(jwt, issuer, kid, true);
+      }
       ExceptionUtil.throwRuntimeExceptionAndLog(
           logger,
           String.format("JWT verification failed with error: %s", e.getMessage()),
           e,
           AuthenticationException.class);
+      return null;
     }
-    return verifiedJwt;
   }
 }

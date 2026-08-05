@@ -65,7 +65,7 @@ final class LocationTaggingAccessDecision implements AccessDecision {
   private final String tagSystem;
   private final LocationTagMutator tagMutator;
   private final String userAccessLevelTypeCode;
-  private final String userAssignedLocationId;
+  private final List<String> userAssignedLocationIds;
   private final String leafLocationTypeCode;
   private final ResourceType expectedResourceType;
 
@@ -81,7 +81,7 @@ final class LocationTaggingAccessDecision implements AccessDecision {
       String tagSystem,
       LocationTagMutator tagMutator,
       String userAccessLevelTypeCode,
-      String userAssignedLocationId,
+      List<String> userAssignedLocationIds,
       String leafLocationTypeCode,
       ResourceType expectedResourceType,
       boolean handleLocationCacheUpdates,
@@ -94,7 +94,7 @@ final class LocationTaggingAccessDecision implements AccessDecision {
     this.tagSystem = tagSystem;
     this.tagMutator = tagMutator;
     this.userAccessLevelTypeCode = userAccessLevelTypeCode;
-    this.userAssignedLocationId = userAssignedLocationId;
+    this.userAssignedLocationIds = userAssignedLocationIds;
     this.leafLocationTypeCode = leafLocationTypeCode;
     this.expectedResourceType = expectedResourceType;
     this.handleLocationCacheUpdates = handleLocationCacheUpdates;
@@ -136,7 +136,7 @@ final class LocationTaggingAccessDecision implements AccessDecision {
       String tagSystem,
       LocationTagMutator tagMutator,
       String userAccessLevelTypeCode,
-      String userAssignedLocationId,
+      List<String> userAssignedLocationIds,
       String leafLocationTypeCode,
       ResourceType expectedResourceType,
       boolean handleLocationCacheUpdates,
@@ -150,7 +150,7 @@ final class LocationTaggingAccessDecision implements AccessDecision {
         tagSystem,
         tagMutator,
         userAccessLevelTypeCode,
-        userAssignedLocationId,
+        userAssignedLocationIds,
         leafLocationTypeCode,
         expectedResourceType,
         handleLocationCacheUpdates,
@@ -265,7 +265,7 @@ final class LocationTaggingAccessDecision implements AccessDecision {
       desired =
           tagMutator.computeTagsForWrite(
               resource,
-              userAssignedLocationId,
+              userAssignedLocationIds,
               userAccessLevelTypeCode,
               httpFhirClient,
               fhirContext);

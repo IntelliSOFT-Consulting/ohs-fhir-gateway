@@ -1,0 +1,40 @@
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "PractitionerRole",
+        "id": "practitioner-cu-1",
+        "code": [
+          {
+            "coding": [
+              {
+                "system": "http://livinggoods.org/fhir/CodeSystem/practitioner-role",
+                "code": "community-health-assistant"
+              }
+            ]
+          }
+        ],
+        "location": [{ "reference": "Location/cu-1" }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "PractitionerRole",
+        "id": "practitioner-cu-2",
+        "code": [
+          {
+            "coding": [
+              {
+                "system": "http://livinggoods.org/fhir/CodeSystem/practitioner-role",
+                "code": "community-health-assistant"
+              }
+            ]
+          }
+        ],
+        "location": [{ "reference": "Location/cu-2" }]
+      }
+    }
+  ]
+}

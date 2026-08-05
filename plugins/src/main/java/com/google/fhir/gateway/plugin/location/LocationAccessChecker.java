@@ -29,8 +29,11 @@ import com.google.fhir.gateway.interfaces.NoOpAccessDecision;
 import com.google.fhir.gateway.interfaces.RequestDetailsReader;
 import com.google.fhir.gateway.interfaces.RequestMutation;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.http.HttpResponse;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Resource;
@@ -62,7 +65,7 @@ public final class LocationAccessChecker implements AccessChecker {
 
   private final String practitionerId;
   private final String userRole;
-  private final String userAssignedLocationId;
+  private final List<String> userAssignedLocationIds;
   private final String userAccessLevelTypeCode;
   private final LocationTagMutator tagMutator;
 
@@ -84,7 +87,7 @@ public final class LocationAccessChecker implements AccessChecker {
       LocationCachingService.PractitionerContext ctx =
           cache.getPractitionerContext(practitionerId, config, httpFhirClient, fhirContext);
       this.userRole = ctx.role();
-      this.userAssignedLocationId = ctx.primaryLocationId();
+      this.userAssignedLocationIds = ctx.assignedLocationIds();
     } catch (Exception e) {
       throw new IllegalStateException("Failed to resolve practitioner context", e);
     }
@@ -94,11 +97,11 @@ public final class LocationAccessChecker implements AccessChecker {
 
     logger.info(
         "Initialized LocationAccessChecker for practitioner {} role {} accessLevel {}"
-            + " assignedLocation {}",
+            + " assignedLocations {}",
         practitionerId,
         userRole,
         userAccessLevelTypeCode,
-        userAssignedLocationId);
+        userAssignedLocationIds);
   }
 
   @Override
@@ -153,7 +156,7 @@ public final class LocationAccessChecker implements AccessChecker {
           config.getLocationTagSystem(),
           null,
           userAccessLevelTypeCode,
-          userAssignedLocationId,
+          userAssignedLocationIds,
           config.getLeafLocationTypeCode(),
           ResourceType.Location,
           true,
@@ -176,32 +179,20 @@ public final class LocationAccessChecker implements AccessChecker {
       return LocationTaggingAccessDecision.allow();
     }
 
-    String leafType = config.getLeafLocationTypeCode();
-    List<String> leafLocationIds;
-    if (leafType.equals(userAccessLevelTypeCode)) {
-      leafLocationIds = List.of(userAssignedLocationId);
-    } else {
-      int limit = config.getMaxDescendantTagsInSearch();
-      leafLocationIds = cache.getDescendantIdsByType(userAssignedLocationId, leafType, limit);
-      if (leafLocationIds.size() > limit) {
-        logger.warn(
-            "Too many {} descendants under {}; denying search to fail closed.",
-            leafType,
-            userAssignedLocationId);
-        return NoOpAccessDecision.accessDenied();
-      }
-      if (leafLocationIds.isEmpty()) {
-        logger.warn(
-            "No cached {} descendants under {}; denying search to fail closed.",
-            leafType,
-            userAssignedLocationId);
-        return NoOpAccessDecision.accessDenied();
-      }
+    List<String> leafLocationIds = resolveLeafLocationIdsForSearch();
+    if (leafLocationIds == null) {
+      return NoOpAccessDecision.accessDenied();
+    }
+    if (leafLocationIds.isEmpty()) {
+      logger.warn(
+          "No leaf locations in scope for practitioner {}; denying search to fail closed.",
+          practitionerId);
+      return NoOpAccessDecision.accessDenied();
     }
 
     List<String> tokenValues =
         leafLocationIds.stream()
-            .map(id -> config.getLocationTagSystem() + "|Location/" + id)
+            .map(id -> config.getLocationTagSystem() + "|" + id)
             .collect(java.util.stream.Collectors.toList());
 
     RequestMutation mutation =
@@ -210,6 +201,40 @@ public final class LocationAccessChecker implements AccessChecker {
             .additionalQueryParams(Map.of("_tag", tokenValues))
             .build();
     return LocationTaggingAccessDecision.withSearchMutation(mutation, practitionerId);
+  }
+
+  /**
+   * Resolves leaf location IDs for search rewrite. Returns null when descendant expansion exceeds
+   * the configured limit (fail closed).
+   */
+  private List<String> resolveLeafLocationIdsForSearch() {
+    String leafType = config.getLeafLocationTypeCode();
+    if (leafType.equals(userAccessLevelTypeCode)) {
+      return userAssignedLocationIds;
+    }
+
+    int limit = config.getMaxDescendantTagsInSearch();
+    Set<String> leafIds = new LinkedHashSet<>();
+    for (String assignedLocationId : userAssignedLocationIds) {
+      List<String> descendants = cache.getDescendantIdsByType(assignedLocationId, leafType, limit);
+      if (descendants.size() > limit) {
+        logger.warn(
+            "Too many {} descendants under {}; denying search to fail closed.",
+            leafType,
+            assignedLocationId);
+        return null;
+      }
+      leafIds.addAll(descendants);
+    }
+
+    if (leafIds.size() > limit) {
+      logger.warn(
+          "Too many combined {} descendants for practitioner {}; denying search to fail closed.",
+          leafType,
+          practitionerId);
+      return null;
+    }
+    return new ArrayList<>(leafIds);
   }
 
   private AccessDecision processRead(RequestDetailsReader requestDetails) throws IOException {
@@ -230,7 +255,11 @@ public final class LocationAccessChecker implements AccessChecker {
 
     boolean ok =
         tagMutator.isAccessibleByTags(
-            resource, userAssignedLocationId, userAccessLevelTypeCode, httpFhirClient, fhirContext);
+            resource,
+            userAssignedLocationIds,
+            userAccessLevelTypeCode,
+            httpFhirClient,
+            fhirContext);
     return new NoOpAccessDecision(ok);
   }
 
@@ -242,7 +271,7 @@ public final class LocationAccessChecker implements AccessChecker {
         !tagMutator
             .computeTagsForWrite(
                 resource,
-                userAssignedLocationId,
+                userAssignedLocationIds,
                 userAccessLevelTypeCode,
                 httpFhirClient,
                 fhirContext)
@@ -258,7 +287,7 @@ public final class LocationAccessChecker implements AccessChecker {
         config.getLocationTagSystem(),
         tagMutator,
         userAccessLevelTypeCode,
-        userAssignedLocationId,
+        userAssignedLocationIds,
         config.getLeafLocationTypeCode(),
         safeFromCode(requestDetails.getResourceName()),
         false,
@@ -279,7 +308,7 @@ public final class LocationAccessChecker implements AccessChecker {
         !tagMutator
             .computeTagsForWrite(
                 resource,
-                userAssignedLocationId,
+                userAssignedLocationIds,
                 userAccessLevelTypeCode,
                 httpFhirClient,
                 fhirContext)
@@ -295,7 +324,7 @@ public final class LocationAccessChecker implements AccessChecker {
         config.getLocationTagSystem(),
         tagMutator,
         userAccessLevelTypeCode,
-        userAssignedLocationId,
+        userAssignedLocationIds,
         config.getLeafLocationTypeCode(),
         safeFromCode(requestDetails.getResourceName()),
         false,
@@ -335,7 +364,7 @@ public final class LocationAccessChecker implements AccessChecker {
               !tagMutator
                   .computeTagsForWrite(
                       r,
-                      userAssignedLocationId,
+                      userAssignedLocationIds,
                       userAccessLevelTypeCode,
                       httpFhirClient,
                       fhirContext)
@@ -368,7 +397,7 @@ public final class LocationAccessChecker implements AccessChecker {
                     fhirContext.newJsonParser().parseResource(entryResp.getEntity().getContent());
             if (!tagMutator.isAccessibleByTags(
                 fetched,
-                userAssignedLocationId,
+                userAssignedLocationIds,
                 userAccessLevelTypeCode,
                 httpFhirClient,
                 fhirContext)) {
@@ -392,7 +421,7 @@ public final class LocationAccessChecker implements AccessChecker {
         config.getLocationTagSystem(),
         tagMutator,
         userAccessLevelTypeCode,
-        userAssignedLocationId,
+        userAssignedLocationIds,
         config.getLeafLocationTypeCode(),
         ResourceType.Bundle,
         false,

@@ -76,6 +76,7 @@ public class FhirProxyServer extends RestfulServer {
 
     // Note interceptor registration order is important.
     registerCorsInterceptor();
+    registerInterceptor(new FhirGatewayExceptionHandlingInterceptor());
 
     try {
       logger.info("Adding BearerAuthorizationInterceptor ");

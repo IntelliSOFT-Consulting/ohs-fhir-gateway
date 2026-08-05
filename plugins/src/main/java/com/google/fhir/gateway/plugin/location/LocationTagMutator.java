@@ -80,13 +80,14 @@ final class LocationTagMutator {
   /** Compute the full tag set (facility + ancestor ids) to apply to a resource. */
   Set<Coding> computeTagsForWrite(
       Resource resource,
-      String userAssignedLocationId,
+      List<String> userAssignedLocationIds,
       String userAccessLevelTypeCode,
       HttpFhirClient httpFhirClient,
       ca.uhn.fhir.context.FhirContext fhirContext)
       throws IOException {
     Preconditions.checkNotNull(resource, "resource");
-    Preconditions.checkNotNull(userAssignedLocationId, "userAssignedLocationId");
+    Preconditions.checkNotNull(userAssignedLocationIds, "userAssignedLocationIds");
+    Preconditions.checkArgument(!userAssignedLocationIds.isEmpty(), "userAssignedLocationIds");
     Preconditions.checkNotNull(userAccessLevelTypeCode, "userAccessLevelTypeCode");
     Preconditions.checkNotNull(httpFhirClient, "httpFhirClient");
     Preconditions.checkNotNull(fhirContext, "fhirContext");
@@ -101,8 +102,8 @@ final class LocationTagMutator {
       String ancestorAtUserLevel =
           cache.findAncestorAtLevel(
               taggedLocationId, userAccessLevelTypeCode, httpFhirClient, fhirContext);
-      if (ancestorAtUserLevel != null && ancestorAtUserLevel.equals(userAssignedLocationId)) {
-        tags.add(toCoding("Location/" + taggedLocationId));
+      if (ancestorAtUserLevel != null && userAssignedLocationIds.contains(ancestorAtUserLevel)) {
+        tags.add(toCoding(taggedLocationId));
       }
       return tags;
     }
@@ -112,7 +113,7 @@ final class LocationTagMutator {
       return Set.of();
     }
 
-    tags.add(toCoding("Location/" + userAssignedLocationId));
+    tags.add(toCoding(userAssignedLocationIds.get(0)));
     return tags;
   }
 
@@ -137,12 +138,13 @@ final class LocationTagMutator {
    */
   boolean isAccessibleByTags(
       Resource resource,
-      String userAssignedLocationId,
+      List<String> userAssignedLocationIds,
       String userAccessLevelTypeCode,
       HttpFhirClient httpFhirClient,
       ca.uhn.fhir.context.FhirContext fhirContext)
       throws IOException {
     Preconditions.checkNotNull(resource, "resource");
+    Preconditions.checkNotNull(userAssignedLocationIds, "userAssignedLocationIds");
 
     if (config.getRootLocationTypeCode().equals(userAccessLevelTypeCode)) {
       return true;
@@ -162,7 +164,7 @@ final class LocationTagMutator {
       String taggedId = code.startsWith("Location/") ? code.substring("Location/".length()) : code;
       String ancestorAtUserLevel =
           cache.findAncestorAtLevel(taggedId, userAccessLevelTypeCode, httpFhirClient, fhirContext);
-      if (ancestorAtUserLevel != null && ancestorAtUserLevel.equals(userAssignedLocationId)) {
+      if (ancestorAtUserLevel != null && userAssignedLocationIds.contains(ancestorAtUserLevel)) {
         return true;
       }
     }
